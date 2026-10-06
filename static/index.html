@@ -1,0 +1,467 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Secure Web Chat</title>
+
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            background: #0f172a;
+            color: #e5e7eb;
+            margin: 0;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 850px;
+            margin: auto;
+        }
+
+        .card {
+            background: #111827;
+            border: 1px solid #374151;
+            border-radius: 14px;
+            padding: 20px;
+        }
+
+        h1 {
+            color: #93c5fd;
+            margin-top: 0;
+        }
+
+        input {
+            padding: 12px;
+            border-radius: 10px;
+            border: 1px solid #4b5563;
+            background: #1f2937;
+            color: white;
+            width: 100%;
+            box-sizing: border-box;
+            margin-top: 10px;
+        }
+
+        button {
+            padding: 12px 18px;
+            border: none;
+            border-radius: 10px;
+            background: #2563eb;
+            color: white;
+            cursor: pointer;
+            margin-top: 10px;
+            font-size: 15px;
+        }
+
+        button:disabled {
+            background: #4b5563;
+            cursor: not-allowed;
+        }
+
+        #messages {
+            height: 360px;
+            overflow-y: auto;
+            border: 1px solid #374151;
+            border-radius: 10px;
+            padding: 12px;
+            margin: 15px 0;
+            background: #020617;
+        }
+
+        .message {
+            margin: 8px 0;
+            line-height: 1.4;
+            word-wrap: break-word;
+        }
+
+        .system {
+            color: #9ca3af;
+            font-style: italic;
+        }
+
+        .me {
+            color: #86efac;
+        }
+
+        .peer {
+            color: #93c5fd;
+        }
+
+        .row {
+            display: flex;
+            gap: 10px;
+        }
+
+        #messageInput {
+            flex: 1;
+            margin-top: 0;
+        }
+
+        #sendBtn {
+            margin-top: 0;
+        }
+
+        .small {
+            color: #9ca3af;
+            font-size: 12px;
+            word-break: break-word;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="container">
+        <div class="card">
+            <h1>Secure Web Chat</h1>
+            <div class="small">
+                Hybrid cryptography: ECDH P-256 + HKDF-SHA256 + AES-256-GCM
+            </div>
+
+            <div id="joinBox">
+                <input id="nameInput" type="text" placeholder="Enter your name" maxlength="40">
+                <button id="joinBtn">Join Secure Chat</button>
+            </div>
+
+            <div id="chatBox" hidden>
+                <div id="statusText" class="small">Starting...</div>
+
+                <div id="messages"></div>
+
+                <div class="row">
+                    <input id="messageInput" type="text" placeholder="Type encrypted message..." disabled>
+                    <button id="sendBtn" disabled>Send</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let ws = null;
+        let keyPair = null;
+        let aesKey = null;
+        let peerName = null;
+        let userName = "";
+
+        const joinBox = document.getElementById("joinBox");
+        const chatBox = document.getElementById("chatBox");
+        const nameInput = document.getElementById("nameInput");
+        const joinBtn = document.getElementById("joinBtn");
+        const statusText = document.getElementById("statusText");
+        const messages = document.getElementById("messages");
+        const messageInput = document.getElementById("messageInput");
+        const sendBtn = document.getElementById("sendBtn");
+
+        function addSystem(text) {
+            const div = document.createElement("div");
+            div.className = "message system";
+            div.textContent = text;
+            messages.appendChild(div);
+            messages.scrollTop = messages.scrollHeight;
+        }
+
+        function addMessage(sender, text, mine = false) {
+            const div = document.createElement("div");
+            div.className = "message " + (mine ? "me" : "peer");
+            div.textContent = sender + ": " + text;
+            messages.appendChild(div);
+            messages.scrollTop = messages.scrollHeight;
+        }
+
+        function setChatEnabled(enabled) {
+            messageInput.disabled = !enabled;
+            sendBtn.disabled = !enabled;
+        }
+
+        function bufToB64(buffer) {
+            const bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
+            let binary = "";
+            const chunkSize = 8192;
+
+            for (let i = 0; i < bytes.byteLength; i += chunkSize) {
+                binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
+            }
+
+            return btoa(binary);
+        }
+
+        function b64ToBuf(base64) {
+            const binary = atob(base64);
+            const bytes = new Uint8Array(binary.length);
+
+            for (let i = 0; i < binary.length; i++) {
+                bytes[i] = binary.charCodeAt(i);
+            }
+
+            return bytes;
+        }
+
+        async function jwkFingerprint(jwk) {
+            const sorted = Object.keys(jwk).sort();
+            const stableJson = JSON.stringify(jwk, sorted);
+            const data = new TextEncoder().encode(stableJson);
+            const hash = await crypto.subtle.digest("SHA-256", data);
+            const hashArray = Array.from(new Uint8Array(hash));
+            return hashArray.map(b => b.toString(16).padStart(2, "0")).join("").slice(0, 32);
+        }
+
+        async function importPublicKey(jwk) {
+            const cleanJwk = { ...jwk };
+            delete cleanJwk.key_ops;
+            delete cleanJwk.ext;
+
+            return await crypto.subtle.importKey(
+                "jwk",
+                cleanJwk,
+                {
+                    name: "ECDH",
+                    namedCurve: "P-256"
+                },
+                false,
+                []
+            );
+        }
+
+        async function deriveAesKey(privateKey, publicKey) {
+            const sharedSecret = await crypto.subtle.deriveBits(
+                {
+                    name: "ECDH",
+                    public: publicKey
+                },
+                privateKey,
+                256
+            );
+
+            const hkdfKey = await crypto.subtle.importKey(
+                "raw",
+                sharedSecret,
+                "HKDF",
+                false,
+                ["deriveKey"]
+            );
+
+            const salt = new TextEncoder().encode("kamaraj-network-security-lab");
+            const info = new TextEncoder().encode("secure-web-chat-v1");
+
+            return await crypto.subtle.deriveKey(
+                {
+                    name: "HKDF",
+                    hash: "SHA-256",
+                    salt: salt,
+                    info: info
+                },
+                hkdfKey,
+                {
+                    name: "AES-GCM",
+                    length: 256
+                },
+                false,
+                ["encrypt", "decrypt"]
+            );
+        }
+
+        async function encryptMessage(text) {
+            const nonce = crypto.getRandomValues(new Uint8Array(12));
+            const encoded = new TextEncoder().encode(text);
+
+            const ciphertext = await crypto.subtle.encrypt(
+                {
+                    name: "AES-GCM",
+                    iv: nonce
+                },
+                aesKey,
+                encoded
+            );
+
+            const combined = new Uint8Array(nonce.byteLength + ciphertext.byteLength);
+            combined.set(nonce, 0);
+            combined.set(new Uint8Array(ciphertext), nonce.byteLength);
+
+            return bufToB64(combined.buffer);
+        }
+
+        async function decryptMessage(base64Data) {
+            const combined = b64ToBuf(base64Data);
+
+            if (combined.byteLength <= 12) {
+                throw new Error("Invalid encrypted message");
+            }
+
+            const nonce = combined.slice(0, 12);
+            const ciphertext = combined.slice(12);
+
+            const plaintext = await crypto.subtle.decrypt(
+                {
+                    name: "AES-GCM",
+                    iv: nonce
+                },
+                aesKey,
+                ciphertext
+            );
+
+            return new TextDecoder().decode(plaintext);
+        }
+
+        async function joinChat() {
+            userName = nameInput.value.trim();
+
+            if (!userName) {
+                alert("Please enter your name.");
+                return;
+            }
+
+            if (!window.crypto || !window.crypto.subtle) {
+                statusText.textContent = "Web Crypto is not available. Use HTTPS or localhost.";
+                alert("Web Crypto is not available. Use HTTPS or localhost.");
+                return;
+            }
+
+            joinBtn.disabled = true;
+            nameInput.disabled = true;
+            statusText.textContent = "Generating cryptographic keys pair...";
+
+            joinBox.hidden = true;
+            chatBox.hidden = false;
+
+            try {
+                keyPair = await crypto.subtle.generateKey(
+                    {
+                        name: "ECDH",
+                        namedCurve: "P-256"
+                    },
+                    true,
+                    ["deriveKey", "deriveBits"]
+                );
+
+                const publicKeyJwk = await crypto.subtle.exportKey(
+                    "jwk",
+                    keyPair.publicKey
+                );
+
+                const wsProtocol = location.protocol === "https:" ? "wss://" : "ws://";
+                ws = new WebSocket(wsProtocol + location.host + "/ws");
+
+                ws.onopen = () => {
+                    ws.send(JSON.stringify({
+                        type: "join",
+                        name: userName,
+                        pub: publicKeyJwk
+                    }));
+
+                    addSystem("Connected to server. Waiting for peer...");
+                    statusText.textContent = "Waiting for peer...";
+                };
+
+                ws.onmessage = async (event) => {
+                    try {
+                        const msg = JSON.parse(event.data);
+
+                        if (msg.type === "status") {
+                            addSystem(msg.message);
+                        }
+
+                        else if (msg.type === "error") {
+                            addSystem("Error: " + msg.message);
+                            statusText.textContent = "Error";
+                        }
+
+                        else if (msg.type === "peer") {
+                            peerName = msg.name || "Peer";
+                            statusText.textContent = "Deriving shared secure key with " + peerName + "...";
+
+                            const peerPublicKey = await importPublicKey(msg.pub);
+                            aesKey = await deriveAesKey(keyPair.privateKey, peerPublicKey);
+
+                            setChatEnabled(true);
+                            addSystem("Secure channel established with " + peerName);
+                            statusText.textContent = "Secure channel active with " + peerName;
+
+                            const fingerprint = await jwkFingerprint(msg.pub);
+                            addSystem("Peer key fingerprint: " + fingerprint);
+                        }
+
+                        else if (msg.type === "peer_left") {
+                            addSystem(msg.name + " left the chat.");
+                            aesKey = null;
+                            peerName = null;
+                            setChatEnabled(false);
+                            statusText.textContent = "Peer disconnected. Waiting for new peer...";
+                        }
+
+                        else if (msg.type === "chat") {
+                            if (!aesKey) {
+                                addSystem("Secure key not ready. Message ignored.");
+                                return;
+                            }
+
+                            const text = await decryptMessage(msg.data);
+                            addMessage(msg.from || "Peer", text, false);
+                        }
+
+                    } catch (error) {
+                        console.error(error);
+                        addSystem("Failed to process incoming message.");
+                    }
+                };
+
+                ws.onclose = () => {
+                    addSystem("Disconnected from server.");
+                    setChatEnabled(false);
+                    statusText.textContent = "Disconnected from server";
+                };
+
+                ws.onerror = () => {
+                    addSystem("WebSocket error. Check HTTPS certificate and network.");
+                };
+
+            } catch (error) {
+                console.error(error);
+                addSystem("Setup failed: " + error);
+                statusText.textContent = "Setup failed";
+                joinBtn.disabled = false;
+                nameInput.disabled = false;
+            }
+        }
+
+        async function sendMessage() {
+            const text = messageInput.value.trim();
+
+            if (!text || !aesKey || !ws || ws.readyState !== WebSocket.OPEN) {
+                return;
+            }
+
+            try {
+                const encryptedData = await encryptMessage(text);
+
+                ws.send(JSON.stringify({
+                    type: "chat",
+                    data: encryptedData
+                }));
+
+                addMessage("You", text, true);
+                messageInput.value = "";
+
+            } catch (error) {
+                console.error(error);
+                addSystem("Failed to encrypt or send message.");
+            }
+        }
+
+        joinBtn.addEventListener("click", joinChat);
+
+        sendBtn.addEventListener("click", sendMessage);
+
+        messageInput.addEventListener("keydown", (event) => {
+            if (event.key === "Enter") {
+                sendMessage();
+            }
+        });
+
+        window.addEventListener("load", () => {
+            if (!window.isSecureContext || !window.crypto || !window.crypto.subtle) {
+                statusText.textContent = "Web Crypto unavailable. Open this page using HTTPS or localhost.";
+                joinBtn.disabled = true;
+            }
+        });
+    </script>
+</body>
+</html>
